@@ -30,7 +30,7 @@
 ---
 
 ## 📸 界面预览 | Screenshots
-<img width="975" height="639" alt="image" src="https://github.com/user-attachments/assets/77c4dbc6-aeb7-445b-9493-501069b96dc7" />
+<img width="955" height="620" alt="image" src="https://github.com/user-attachments/assets/050ee7b0-bff9-408d-b3e9-e18cf1f1373f" />
 
 
 ## 🛠️ 编译与运行 | Build & Run
