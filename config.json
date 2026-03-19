@@ -1,0 +1,11 @@
+{
+  "charset": "Utf8",
+  "line_ending": "CrLf",
+  "show_hex": false,
+  "show_timestamp": true,
+  "auto_scroll": true,
+  "format_json": true,
+  "filter_ansi": true,
+  "font_name": "Default",
+  "font_size": 16.0
+}
