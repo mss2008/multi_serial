@@ -181,6 +181,8 @@ struct MultiSerialApp {
     search_visible: bool,
     search_matches: Vec<usize>,
     search_current: usize,
+    scroll_to_match_needed: bool,
+    last_click_idx: Option<usize>,
 
     // Send
     send_buffer: String,
@@ -225,6 +227,8 @@ impl Default for MultiSerialApp {
             send_buffer: String::new(),
             send_hex: false,
             send_history: Vec::new(),
+            scroll_to_match_needed: false,
+            last_click_idx: None,
             status_msg: "Ready".to_string(),
         };
         for p in &ports {
@@ -645,6 +649,59 @@ impl eframe::App for MultiSerialApp {
             }
         }
 
+        // ── Bottom Panel (Send Area) ─────────────────────────────
+        if !self.open_ports.is_empty() && !self.active_tab.is_empty() {
+            egui::TopBottomPanel::bottom("send_panel")
+                .frame(egui::Frame::none().fill(C::BG_BASE).inner_margin(egui::Margin { left: 8.0, right: 8.0, top: 4.0, bottom: 8.0 }))
+                .show(ctx, |ui| {
+                    ui.separator();
+                    // Send area
+                    ui.horizontal(|ui| {
+                        ui.add_space(4.0);
+                        ui.checkbox(&mut self.send_hex, egui::RichText::new("HEX").color(C::TEXT_DIM).small());
+
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.send_buffer)
+                                .hint_text("Type command and press Enter…")
+                                .desired_width(ui.available_width() - 80.0)
+                                .font(egui::TextStyle::Monospace)
+                        );
+
+                        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let send_clicked = ui.add(
+                            egui::Button::new(egui::RichText::new("Send ▶").color(egui::Color32::WHITE))
+                                .fill(C::ACCENT)
+                                .rounding(6.0)
+                        ).clicked();
+
+                        if (enter || send_clicked) && !self.send_buffer.is_empty() {
+                            let data = if self.send_hex {
+                                hex_to_bytes(&self.send_buffer)
+                            } else {
+                                let ending = self.line_ending.as_str();
+                                format!("{}{}", self.send_buffer, ending).into_bytes()
+                            };
+                            if let Some(inst) = self.open_ports.get_mut(&self.active_tab) {
+                                match inst.manager.send(&data) {
+                                    Ok(()) => {
+                                        if !self.send_history.contains(&self.send_buffer) {
+                                            self.send_history.push(self.send_buffer.clone());
+                                            if self.send_history.len() > 20 {
+                                                self.send_history.remove(0);
+                                            }
+                                        }
+                                        self.status_msg = format!("Sent {} bytes", data.len());
+                                    }
+                                    Err(e) => { self.status_msg = format!("Send error: {}", e); }
+                                }
+                            }
+                            self.send_buffer.clear();
+                            resp.request_focus();
+                        }
+                    });
+                });
+        }
+
         // ── Central Panel ────────────────────────────────────────
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(C::BG_BASE).inner_margin(egui::Margin::same(0.0)))
@@ -757,18 +814,36 @@ impl eframe::App for MultiSerialApp {
                                 .fill(egui::Color32::from_rgb(60, 100, 120))
                                 .rounding(4.0)
                         ).clicked() && total > 0 {
-                            if self.search_current == 0 {
-                                self.search_current = total - 1;
+                            if let Some(click_idx) = self.last_click_idx.take() {
+                                if let Some(prev_idx) = self.search_matches.iter().rposition(|&m| m < click_idx) {
+                                    self.search_current = prev_idx;
+                                } else {
+                                    self.search_current = total - 1;
+                                }
                             } else {
-                                self.search_current -= 1;
+                                if self.search_current == 0 {
+                                    self.search_current = total - 1;
+                                } else {
+                                    self.search_current -= 1;
+                                }
                             }
+                            self.scroll_to_match_needed = true;
                         }
                         if ui.add(
                             egui::Button::new(egui::RichText::new("▼ Next").color(egui::Color32::WHITE))
                                 .fill(egui::Color32::from_rgb(60, 100, 120))
                                 .rounding(4.0)
                         ).clicked() && total > 0 {
-                            self.search_current = (self.search_current + 1) % total;
+                            if let Some(click_idx) = self.last_click_idx.take() {
+                                if let Some(next_idx) = self.search_matches.iter().position(|&m| m > click_idx) {
+                                    self.search_current = next_idx;
+                                } else {
+                                    self.search_current = 0;
+                                }
+                            } else {
+                                self.search_current = (self.search_current + 1) % total;
+                            }
+                            self.scroll_to_match_needed = true;
                         }
                         // Enter = next, Shift+Enter = prev
                         if search_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -778,6 +853,7 @@ impl eframe::App for MultiSerialApp {
                                 } else {
                                     self.search_current = (self.search_current + 1) % total;
                                 }
+                                self.scroll_to_match_needed = true;
                             }
                             search_resp.request_focus();
                         }
@@ -796,114 +872,142 @@ impl eframe::App for MultiSerialApp {
 
                 // Log area
                 if let Some(inst) = self.open_ports.get(&self.active_tab) {
-                    let entries: Vec<LogEntry> = inst.manager.logs.lock().unwrap().clone();
+                    let logs = inst.manager.logs.lock().unwrap();
+                    let total_logs = logs.len();
 
-                    let available = ui.available_height() - 44.0;
-                    let search_highlight = if !self.search_text.is_empty() && self.search_visible {
-                        Some(self.search_text.clone())
-                    } else { None };
-                    let highlight_idx = if !self.search_matches.is_empty() {
-                        Some(self.search_matches.get(self.search_current).copied().unwrap_or(0))
-                    } else { None };
+                    let mut full_text = String::new();
+                    let mut line_starts = Vec::with_capacity(total_logs);
+                    for entry in logs.iter() {
+                        line_starts.push(full_text.len());
+                        if self.show_timestamp {
+                            full_text.push_str(&format!("[{}] ", entry.timestamp));
+                        }
+                        full_text.push_str(&self.format_log_text(entry));
+                        full_text.push('\n');
+                    }
+                    line_starts.push(full_text.len()); // End of last line
 
-                    let scroll = egui::ScrollArea::vertical()
-                        .stick_to_bottom(self.auto_scroll && highlight_idx.is_none())
-                        .max_height(available);
+                    let search_query = if self.search_visible && !self.search_text.is_empty() {
+                        Some(self.search_text.to_lowercase())
+                    } else {
+                        None
+                    };
+                    let current_match_idx = if !self.search_matches.is_empty() {
+                        Some(self.search_matches[self.search_current])
+                    } else {
+                        None
+                    };
 
-                    scroll.show(ui, |ui| {
-                            ui.set_min_width(ui.available_width());
-                            for (idx, entry) in entries.iter().enumerate() {
-                                let text = self.format_log_text(entry);
-                                let mut color = log_color(&entry.text);
+                    // Pre-calculate colors to avoid capturing `self` in layouter
+                    let log_colors_pre: Vec<egui::Color32> = logs.iter()
+                        .map(|entry| log_color(&self.format_log_text(entry)))
+                        .collect();
+                    let font_size = self.font_size;
 
-                                // Highlight search match
-                                let is_current_match = highlight_idx == Some(idx);
-                                let is_any_match = search_highlight.as_ref()
-                                    .map(|q| entry.text.to_lowercase().contains(&q.to_lowercase()))
-                                    .unwrap_or(false);
+                    let available_height = ui.available_height();
+                    
+                    let mut layouter = |ui: &egui::Ui, text: &str, _wrap_width: f32| {
+                        let mut job = egui::text::LayoutJob::default();
+                        job.wrap.max_width = f32::INFINITY; 
+                        
+                        let mut char_offset = 0;
+                        for line in text.split('\n') {
+                            let entry_idx = match line_starts.binary_search(&char_offset) {
+                                Ok(idx) => idx,
+                                Err(idx) => idx.saturating_sub(1),
+                            };
+                            
+                            if entry_idx >= total_logs { break; }
+                            
+                            let row_color = log_colors_pre[entry_idx];
+                            let is_current_match = current_match_idx == Some(entry_idx);
+                            
+                            let bg = if is_current_match {
+                                Some(egui::Color32::from_rgb(35, 60, 110))
+                            } else {
+                                None
+                            };
 
-                                // Use solid opaque backgrounds for strong contrast
-                                let (bg, text_color) = if is_current_match {
-                                    (Some(egui::Color32::from_rgb(35, 60, 110)), egui::Color32::WHITE)
-                                } else if is_any_match {
-                                    (Some(egui::Color32::from_rgb(80, 65, 20)), egui::Color32::from_rgb(255, 240, 200))
-                                } else {
-                                    (None, color)
-                                };
+                            let text_format = egui::TextFormat {
+                                font_id: egui::FontId::monospace(font_size),
+                                color: row_color,
+                                background: bg.unwrap_or(egui::Color32::TRANSPARENT),
+                                ..Default::default()
+                            };
 
-                                let frame = if let Some(bg_color) = bg {
-                                    egui::Frame::none().fill(bg_color).inner_margin(egui::Margin { left: 4.0, right: 4.0, top: 1.0, bottom: 1.0 })
-                                } else {
-                                    egui::Frame::none()
-                                };
-
-                                frame.show(ui, |ui| {
-                                    if self.show_timestamp {
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.label(egui::RichText::new(&entry.timestamp).monospace().color(if bg.is_some() { egui::Color32::from_rgb(180, 190, 210) } else { C::TEXT_DIM }).small());
-                                            ui.label(egui::RichText::new(&text).monospace().color(text_color));
-                                        });
-                                    } else {
-                                        ui.add(egui::Label::new(
-                                            egui::RichText::new(&text).monospace().color(text_color)
-                                        ).wrap());
+                            // Check for search hits within this line if it's not the current match (which has its own bg)
+                            if let Some(query) = &search_query {
+                                let line_lower = line.to_lowercase();
+                                let mut start = 0;
+                                while let Some(pos) = line_lower[start..].find(query) {
+                                    let abs_pos = start + pos;
+                                    // Add text before hit
+                                    if abs_pos > start {
+                                        job.append(&line[start..abs_pos], 0.0, text_format.clone());
                                     }
-                                });
-
-                                // Scroll to current match
-                                if is_current_match {
-                                    ui.scroll_to_cursor(Some(egui::Align::Center));
+                                    // Add hit with background
+                                    let mut hit_format = text_format.clone();
+                                    if !is_current_match {
+                                        hit_format.background = egui::Color32::from_rgb(80, 65, 20);
+                                        hit_format.color = egui::Color32::from_rgb(255, 240, 200);
+                                    }
+                                    job.append(&line[abs_pos..abs_pos+query.len()], 0.0, hit_format);
+                                    start = abs_pos + query.len();
                                 }
+                                if start < line.len() {
+                                    job.append(&line[start..], 0.0, text_format);
+                                }
+                            } else {
+                                job.append(line, 0.0, text_format);
                             }
-                        });
-                }
+                            
+                            job.append("\n", 0.0, egui::TextFormat::default());
+                            char_offset += line.len() + 1; // +1 for the \n
+                        }
+                        ui.fonts(|f| f.layout_job(job))
+                    };
 
-                ui.separator();
+                    let scroll_area = egui::ScrollArea::vertical()
+                        .stick_to_bottom(self.auto_scroll && current_match_idx.is_none())
+                        .max_height(available_height);
 
-                // Send area
-                ui.horizontal(|ui| {
-                    ui.add_space(4.0);
-                    ui.checkbox(&mut self.send_hex, egui::RichText::new("HEX").color(C::TEXT_DIM).small());
+                    scroll_area.show(ui, |ui| {
+                        let mut output_text = full_text.clone();
+                        let output = egui::TextEdit::multiline(&mut output_text)
+                            .layouter(&mut layouter)
+                            .frame(false)
+                            .desired_width(f32::INFINITY)
+                            .show(ui);
+                        
+                        let ed_resp = output.response;
 
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.send_buffer)
-                            .hint_text("Type command and press Enter…")
-                            .desired_width(ui.available_width() - 80.0)
-                            .font(egui::TextStyle::Monospace)
-                    );
-
-                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let send_clicked = ui.add(
-                        egui::Button::new(egui::RichText::new("Send ▶").color(egui::Color32::WHITE))
-                            .fill(C::ACCENT)
-                            .rounding(6.0)
-                    ).clicked();
-
-                    if (enter || send_clicked) && !self.send_buffer.is_empty() {
-                        let data = if self.send_hex {
-                            hex_to_bytes(&self.send_buffer)
-                        } else {
-                            let ending = self.line_ending.as_str();
-                            format!("{}{}", self.send_buffer, ending).into_bytes()
-                        };
-                        if let Some(inst) = self.open_ports.get_mut(&self.active_tab) {
-                            match inst.manager.send(&data) {
-                                Ok(()) => {
-                                    if !self.send_history.contains(&self.send_buffer) {
-                                        self.send_history.push(self.send_buffer.clone());
-                                        if self.send_history.len() > 20 {
-                                            self.send_history.remove(0);
-                                        }
-                                    }
-                                    self.status_msg = format!("Sent {} bytes", data.len());
+                        // If user clicked, find which log line it corresponds to
+                        if ed_resp.clicked() {
+                            if let Some(cursor) = output.cursor_range {
+                                let char_idx = cursor.primary.ccursor.index;
+                                // Binary search to find which log line this index belongs to
+                                match line_starts.binary_search(&char_idx) {
+                                    Ok(idx) => self.last_click_idx = Some(idx),
+                                    Err(idx) => self.last_click_idx = Some(idx.saturating_sub(1)),
                                 }
-                                Err(e) => { self.status_msg = format!("Send error: {}", e); }
                             }
                         }
-                        self.send_buffer.clear();
-                        resp.request_focus();
-                    }
-                });
+
+                        if self.scroll_to_match_needed && current_match_idx.is_some() {
+                            if let Some(match_idx) = current_match_idx {
+                                let line_height = self.font_size * 1.25;
+                                let y_offset = (match_idx as f32) * line_height;
+                                let rect = egui::Rect::from_min_size(
+                                    ui.cursor().min + egui::vec2(0.0, y_offset),
+                                    egui::vec2(ui.available_width(), line_height)
+                                );
+                                ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                                self.scroll_to_match_needed = false;
+                            }
+                        }
+                    });
+                    self.scroll_to_match_needed = false;
+                }
             } else {
                 // Empty state
                 ui.centered_and_justified(|ui| {
