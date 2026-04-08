@@ -5,6 +5,8 @@
  * Description: Main application entry point and UI logic for MultiSerial.
  */
 
+#![windows_subsystem = "windows"]
+
 mod serial_manager;
 
 use eframe::egui;
@@ -46,7 +48,6 @@ impl C {
     const YELLOW:     egui::Color32 = egui::Color32::from_rgb(249, 226, 175); // #F9E2AF
     const LAVENDER:   egui::Color32 = egui::Color32::from_rgb(180, 190, 254); // #B4BEFE
     const TEAL:       egui::Color32 = egui::Color32::from_rgb(148, 226, 213); // #94E2D5
-    const PEACH:      egui::Color32 = egui::Color32::from_rgb(250, 179, 135); // #FAB387
     const MUTED_BG:   egui::Color32 = egui::Color32::from_rgb(24, 24, 37);   // darker bg
     const SIDEBAR_BG: egui::Color32 = egui::Color32::from_rgb(24, 24, 37);
     const BTN_ACTIVE: egui::Color32 = egui::Color32::from_rgb(116, 199, 236);// #74C7EC
@@ -195,7 +196,6 @@ struct MultiSerialApp {
 
 struct PortInstance {
     manager: SerialManager,
-    config: PortConfig,
 }
 
 impl Default for MultiSerialApp {
@@ -289,7 +289,7 @@ impl MultiSerialApp {
                 let mut mgr = SerialManager::new();
                 match mgr.connect(&cfg, self.charset) {
                     Ok(()) => {
-                        self.open_ports.insert(name.clone(), PortInstance { manager: mgr, config: cfg });
+                        self.open_ports.insert(name.clone(), PortInstance { manager: mgr });
                         if self.active_tab.is_empty() {
                             self.active_tab = name.clone();
                         }
@@ -332,6 +332,24 @@ impl MultiSerialApp {
         }
         text
     }
+
+    fn update_search_matches(&mut self) {
+        self.search_matches.clear();
+        self.search_current = 0;
+        if !self.search_text.is_empty() {
+            if let Some(inst) = self.open_ports.get(&self.active_tab) {
+                if let Ok(logs) = inst.manager.logs.lock() {
+                    let query = self.search_text.to_lowercase();
+                    for (i, entry) in logs.iter().enumerate() {
+                        let text = self.format_log_text(entry).to_lowercase();
+                        if text.contains(&query) {
+                            self.search_matches.push(i);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn try_format_json(text: &str) -> String {
@@ -365,6 +383,8 @@ fn try_format_json(text: &str) -> String {
 // ── UI ───────────────────────────────────────────────────────────
 impl eframe::App for MultiSerialApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let old_tab = self.active_tab.clone();
+
         // High-contrast selection colors
         let mut visuals = egui::Visuals::dark();
         visuals.selection.bg_fill = egui::Color32::from_rgb(0, 120, 215); // Bright Blue
@@ -528,6 +548,18 @@ impl eframe::App for MultiSerialApp {
                 // Port list
                 let port_names: Vec<String> = self.available_ports.clone();
                 let open_keys: Vec<String> = self.open_ports.keys().cloned().collect();
+
+                if !port_names.is_empty() {
+                    ui.horizontal(|ui| {
+                        let mut all_checked = port_names.iter().all(|p| *self.port_checked.get(p).unwrap_or(&false));
+                        if ui.checkbox(&mut all_checked, egui::RichText::new("Select All").color(C::TEXT_DIM).small()).clicked() {
+                            for p in &port_names {
+                                self.port_checked.insert(p.clone(), all_checked);
+                            }
+                        }
+                    });
+                    ui.add_space(2.0);
+                }
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for port_name in &port_names {
@@ -726,7 +758,9 @@ impl eframe::App for MultiSerialApp {
                         }
                     }
                 });
-                self.active_tab = new_tab;
+                if new_tab != self.active_tab {
+                    self.active_tab = new_tab;
+                }
 
                 // Toolbar
                 ui.horizontal(|ui| {
@@ -753,12 +787,20 @@ impl eframe::App for MultiSerialApp {
                             .rounding(4.0)
                     ).clicked() {
                         self.search_visible = !self.search_visible;
+                        if self.search_visible {
+                            self.update_search_matches();
+                            self.scroll_to_match_needed = true;
+                        }
                     }
                 });
 
                 // Ctrl+F shortcut
                 if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F)) {
                     self.search_visible = !self.search_visible;
+                    if self.search_visible {
+                        self.update_search_matches();
+                        self.scroll_to_match_needed = true;
+                    }
                 }
 
                 // Search bar
@@ -789,20 +831,8 @@ impl eframe::App for MultiSerialApp {
                         
                         // Recalculate matches when text changes
                         if search_resp.changed() {
-                            self.search_matches.clear();
-                            self.search_current = 0;
-                            if !self.search_text.is_empty() {
-                                if let Some(inst) = self.open_ports.get(&self.active_tab) {
-                                    if let Ok(logs) = inst.manager.logs.lock() {
-                                        let query = self.search_text.to_lowercase();
-                                        for (i, entry) in logs.iter().enumerate() {
-                                            if entry.text.to_lowercase().contains(&query) {
-                                                self.search_matches.push(i);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            self.update_search_matches();
+                            self.scroll_to_match_needed = true;
                         }
                         let total = self.search_matches.len();
                         let cur_display = if total > 0 { self.search_current + 1 } else { 0 };
@@ -947,7 +977,10 @@ impl eframe::App for MultiSerialApp {
                                     }
                                     // Add hit with background
                                     let mut hit_format = text_format.clone();
-                                    if !is_current_match {
+                                    if is_current_match {
+                                        hit_format.background = egui::Color32::from_rgb(255, 120, 0); // Bright Orange
+                                        hit_format.color = egui::Color32::WHITE;
+                                    } else {
                                         hit_format.background = egui::Color32::from_rgb(80, 65, 20);
                                         hit_format.color = egui::Color32::from_rgb(255, 240, 200);
                                     }
@@ -995,10 +1028,10 @@ impl eframe::App for MultiSerialApp {
 
                         if self.scroll_to_match_needed && current_match_idx.is_some() {
                             if let Some(match_idx) = current_match_idx {
-                                let line_height = self.font_size * 1.25;
+                                let line_height = ui.fonts(|f| f.row_height(&egui::FontId::monospace(self.font_size)));
                                 let y_offset = (match_idx as f32) * line_height;
                                 let rect = egui::Rect::from_min_size(
-                                    ui.cursor().min + egui::vec2(0.0, y_offset),
+                                    ed_resp.rect.min + egui::vec2(0.0, y_offset),
                                     egui::vec2(ui.available_width(), line_height)
                                 );
                                 ui.scroll_to_rect(rect, Some(egui::Align::Center));
@@ -1034,6 +1067,13 @@ impl eframe::App for MultiSerialApp {
         }
 
         ctx.request_repaint_after(Duration::from_millis(16));
+
+        if self.active_tab != old_tab {
+            if self.search_visible {
+                self.update_search_matches();
+                self.scroll_to_match_needed = true;
+            }
+        }
     }
 }
 

@@ -347,10 +347,6 @@ impl SerialManager {
         self.port = None;
     }
 
-    pub fn is_connected(&self) -> bool {
-        *self.is_running.lock().unwrap()
-    }
-
     pub fn send(&mut self, data: &[u8]) -> Result<()> {
         if let Some(port) = &mut self.port {
             port.write_all(data)?;
