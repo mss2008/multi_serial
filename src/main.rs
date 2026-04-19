@@ -341,8 +341,20 @@ impl MultiSerialApp {
                 if let Ok(logs) = inst.manager.logs.lock() {
                     let query = self.search_text.to_lowercase();
                     for (i, entry) in logs.iter().enumerate() {
-                        let text = self.format_log_text(entry).to_lowercase();
-                        if text.contains(&query) {
+                        let text_formatted = self.format_log_text(entry).to_lowercase();
+                        let mut is_match = text_formatted.contains(&query);
+                        
+                        // Also search the unformatted text so that single-line queries 
+                        // can still match the original JSON string.
+                        if !is_match && !self.show_hex {
+                            let mut text_unformatted = entry.text.clone();
+                            if self.filter_ansi {
+                                text_unformatted = serial_manager::Charset::strip_ansi(&text_unformatted);
+                            }
+                            is_match = text_unformatted.to_lowercase().contains(&query);
+                        }
+
+                        if is_match {
                             self.search_matches.push(i);
                         }
                     }
@@ -875,16 +887,10 @@ impl eframe::App for MultiSerialApp {
                             }
                             self.scroll_to_match_needed = true;
                         }
-                        // Enter = next, Shift+Enter = prev
+                        // Enter = Re-search
                         if search_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            if total > 0 {
-                                if ui.input(|i| i.modifiers.shift) {
-                                    if self.search_current == 0 { self.search_current = total - 1; } else { self.search_current -= 1; }
-                                } else {
-                                    self.search_current = (self.search_current + 1) % total;
-                                }
-                                self.scroll_to_match_needed = true;
-                            }
+                            self.update_search_matches();
+                            self.scroll_to_match_needed = true;
                             search_resp.request_focus();
                         }
                         if ui.add(
@@ -907,12 +913,19 @@ impl eframe::App for MultiSerialApp {
 
                     let mut full_text = String::new();
                     let mut line_starts = Vec::with_capacity(total_logs);
+                    let mut entry_line_numbers = Vec::with_capacity(total_logs);
+                    let mut current_line = 0;
                     for entry in logs.iter() {
                         line_starts.push(full_text.len());
+                        entry_line_numbers.push(current_line);
+                        
+                        let formatted = self.format_log_text(entry);
+                        current_line += formatted.split('\n').count();
+                        
                         if self.show_timestamp {
                             full_text.push_str(&format!("[{}] ", entry.timestamp));
                         }
-                        full_text.push_str(&self.format_log_text(entry));
+                        full_text.push_str(&formatted);
                         full_text.push('\n');
                     }
                     line_starts.push(full_text.len()); // End of last line
@@ -1029,7 +1042,8 @@ impl eframe::App for MultiSerialApp {
                         if self.scroll_to_match_needed && current_match_idx.is_some() {
                             if let Some(match_idx) = current_match_idx {
                                 let line_height = ui.fonts(|f| f.row_height(&egui::FontId::monospace(self.font_size)));
-                                let y_offset = (match_idx as f32) * line_height;
+                                let start_line = entry_line_numbers[match_idx];
+                                let y_offset = (start_line as f32) * line_height;
                                 let rect = egui::Rect::from_min_size(
                                     ed_resp.rect.min + egui::vec2(0.0, y_offset),
                                     egui::vec2(ui.available_width(), line_height)
