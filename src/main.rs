@@ -17,10 +17,13 @@ use std::time::Duration;
 fn main() -> eframe::Result {
     env_logger::init();
 
+    let icon_data = load_icon();
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 820.0])
-            .with_min_inner_size([960.0, 600.0]),
+            .with_min_inner_size([960.0, 600.0])
+            .with_icon(icon_data),
         ..Default::default()
     };
 
@@ -32,6 +35,18 @@ fn main() -> eframe::Result {
             Ok(Box::<MultiSerialApp>::default())
         }),
     )
+}
+
+fn load_icon() -> egui::IconData {
+    let icon_bytes = include_bytes!("../icon.png");
+    let image = image::load_from_memory(icon_bytes).expect("Failed to load icon");
+    let image = image.to_rgba8();
+    let (width, height) = image.dimensions();
+    egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    }
 }
 
 // ── Colors (Catppuccin‑Mocha inspired, eye‑friendly) ─────────────
@@ -119,6 +134,12 @@ fn setup_custom_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     style.spacing.button_padding = egui::vec2(10.0, 4.0);
+    // Scrollbar: always visible, non-floating (solid), takes layout space
+    style.spacing.scroll = egui::style::ScrollStyle {
+        floating: false,
+        bar_width: 10.0,
+        ..style.spacing.scroll
+    };
     ctx.set_style(style);
 }
 
@@ -192,6 +213,11 @@ struct MultiSerialApp {
 
     // Misc
     status_msg: String,
+
+    // Scroll tracking for auto-scroll with tolerance
+    scroll_near_bottom: bool,
+    prev_scroll_offset: f32,
+    force_scroll_to_bottom: bool,
 }
 
 struct PortInstance {
@@ -230,6 +256,9 @@ impl Default for MultiSerialApp {
             scroll_to_match_needed: false,
             last_click_idx: None,
             status_msg: "Ready".to_string(),
+            scroll_near_bottom: true,
+            prev_scroll_offset: 0.0,
+            force_scroll_to_bottom: false,
         };
         for p in &ports {
             app.port_checked.insert(p.clone(), false);
@@ -319,29 +348,60 @@ impl MultiSerialApp {
         }
     }
 
-    fn format_log_text(&self, entry: &LogEntry) -> String {
-        if self.show_hex {
-            return entry.raw.iter().map(|b| format!("{:02X} ", b)).collect::<String>();
+    fn format_log_text(
+        entry: &mut LogEntry,
+        show_hex: bool,
+        filter_ansi: bool,
+        format_json: bool,
+    ) -> String {
+        if let Some(cached) = &entry.cached_text {
+            return cached.clone();
         }
-        let mut text = entry.text.clone();
-        if self.filter_ansi {
-            text = Charset::strip_ansi(&text);
+
+        let formatted = if show_hex {
+            entry.raw.iter().map(|b| format!("{:02X} ", b)).collect::<String>()
+        } else {
+            let mut text = entry.text.clone();
+            if filter_ansi {
+                text = Charset::strip_ansi(&text);
+            }
+            if format_json {
+                text = try_format_json(&text);
+            }
+            text
+        };
+
+        entry.cached_text = Some(formatted.clone());
+        if entry.cached_color.is_none() {
+            entry.cached_color = Some(log_color(&formatted));
         }
-        if self.format_json {
-            text = try_format_json(&text);
+        formatted
+    }
+
+    fn clear_log_cache(&mut self) {
+        for inst in self.open_ports.values_mut() {
+            if let Ok(mut logs) = inst.manager.logs.lock() {
+                for entry in logs.iter_mut() {
+                    entry.cached_text = None;
+                    entry.cached_color = None;
+                }
+            }
         }
-        text
     }
 
     fn update_search_matches(&mut self) {
         self.search_matches.clear();
         self.search_current = 0;
         if !self.search_text.is_empty() {
-            if let Some(inst) = self.open_ports.get(&self.active_tab) {
-                if let Ok(logs) = inst.manager.logs.lock() {
+            let show_hex = self.show_hex;
+            let filter_ansi = self.filter_ansi;
+            let format_json = self.format_json;
+            
+            if let Some(inst) = self.open_ports.get_mut(&self.active_tab) {
+                if let Ok(mut logs) = inst.manager.logs.lock() {
                     let query = self.search_text.to_lowercase();
-                    for (i, entry) in logs.iter().enumerate() {
-                        let text_formatted = self.format_log_text(entry).to_lowercase();
+                    for (i, entry) in logs.iter_mut().enumerate() {
+                        let text_formatted = Self::format_log_text(entry, show_hex, filter_ansi, format_json).to_lowercase();
                         let mut is_match = text_formatted.contains(&query);
                         
                         // Also search the unformatted text so that single-line queries 
@@ -403,6 +463,15 @@ impl eframe::App for MultiSerialApp {
         visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
         ctx.set_visuals(visuals);
 
+        // Force scrollbar to always be visible (non-floating, solid style)
+        // Must re-apply every frame because set_visuals resets the style
+        {
+            let mut style = (*ctx.style()).clone();
+            style.spacing.scroll.floating = false;
+            style.spacing.scroll.bar_width = 10.0;
+            ctx.set_style(style);
+        }
+
         // ── Menu Bar ─────────────────────────────────────────────
         egui::TopBottomPanel::top("menu_bar")
             .frame(egui::Frame::none()
@@ -441,9 +510,9 @@ impl eframe::App for MultiSerialApp {
                 });
 
                 ui.menu_button(menu_text(" View "), |ui| {
-                    if ui.checkbox(&mut self.show_hex,       "Hex View").changed() { self.save_settings(); }
-                    if ui.checkbox(&mut self.show_timestamp, "Show Timestamps").changed() { self.save_settings(); }
-                    if ui.checkbox(&mut self.format_json,    "Format JSON").changed() { self.save_settings(); }
+                    if ui.checkbox(&mut self.show_hex,       "Hex View").changed() { self.clear_log_cache(); self.save_settings(); }
+                    if ui.checkbox(&mut self.show_timestamp, "Show Timestamps").changed() { self.clear_log_cache(); self.save_settings(); }
+                    if ui.checkbox(&mut self.format_json,    "Format JSON").changed() { self.clear_log_cache(); self.save_settings(); }
                     if ui.checkbox(&mut self.auto_scroll,    "Auto Scroll").changed() { self.save_settings(); }
                 });
 
@@ -787,11 +856,17 @@ impl eframe::App for MultiSerialApp {
                         }
                     }
                     ui.separator();
-                    if ui.checkbox(&mut self.show_timestamp, egui::RichText::new("Time").color(C::TEXT).small()).changed() { self.save_settings(); }
-                    if ui.checkbox(&mut self.show_hex,       egui::RichText::new("HEX").color(C::TEXT).small()).changed() { self.save_settings(); }
-                    if ui.checkbox(&mut self.format_json,    egui::RichText::new("JSON").color(C::TEXT).small()).changed() { self.save_settings(); }
-                    if ui.checkbox(&mut self.auto_scroll,    egui::RichText::new("Auto↓").color(C::TEXT).small()).changed() { self.save_settings(); }
-                    if ui.checkbox(&mut self.filter_ansi,    egui::RichText::new("ANSI").color(C::TEXT).small()).changed() { self.save_settings(); }
+                    if ui.checkbox(&mut self.show_timestamp, egui::RichText::new("Time").color(C::TEXT).small()).changed() { self.clear_log_cache(); self.save_settings(); }
+                    if ui.checkbox(&mut self.show_hex,       egui::RichText::new("HEX").color(C::TEXT).small()).changed() { self.clear_log_cache(); self.save_settings(); }
+                    if ui.checkbox(&mut self.format_json,    egui::RichText::new("JSON").color(C::TEXT).small()).changed() { self.clear_log_cache(); self.save_settings(); }
+                    if ui.checkbox(&mut self.auto_scroll,    egui::RichText::new("Auto↓").color(C::TEXT).small()).changed() {
+                        if self.auto_scroll {
+                            self.force_scroll_to_bottom = true;
+                            self.scroll_near_bottom = true;
+                        }
+                        self.save_settings();
+                    }
+                    if ui.checkbox(&mut self.filter_ansi,    egui::RichText::new("ANSI").color(C::TEXT).small()).changed() { self.clear_log_cache(); self.save_settings(); }
                     ui.separator();
                     if ui.add(
                         egui::Button::new(egui::RichText::new("🔍 Search").color(C::TEXT))
@@ -907,47 +982,57 @@ impl eframe::App for MultiSerialApp {
                 ui.separator();
 
                 // Log area
-                if let Some(inst) = self.open_ports.get(&self.active_tab) {
+                let (total_logs, search_query, current_match_idx) = if let Some(inst) = self.open_ports.get(&self.active_tab) {
                     let logs = inst.manager.logs.lock().unwrap();
-                    let total_logs = logs.len();
-
-                    let mut full_text = String::new();
-                    let mut line_starts = Vec::with_capacity(total_logs);
-                    let mut entry_line_numbers = Vec::with_capacity(total_logs);
-                    let mut current_line = 0;
-                    for entry in logs.iter() {
-                        line_starts.push(full_text.len());
-                        entry_line_numbers.push(current_line);
-                        
-                        let formatted = self.format_log_text(entry);
-                        current_line += formatted.split('\n').count();
-                        
-                        if self.show_timestamp {
-                            full_text.push_str(&format!("[{}] ", entry.timestamp));
-                        }
-                        full_text.push_str(&formatted);
-                        full_text.push('\n');
-                    }
-                    line_starts.push(full_text.len()); // End of last line
-
-                    let search_query = if self.search_visible && !self.search_text.is_empty() {
+                    let query = if self.search_visible && !self.search_text.is_empty() {
                         Some(self.search_text.to_lowercase())
                     } else {
                         None
                     };
-                    let current_match_idx = if !self.search_matches.is_empty() {
+                    let match_idx = if !self.search_matches.is_empty() {
                         Some(self.search_matches[self.search_current])
                     } else {
                         None
                     };
+                    (logs.len(), query, match_idx)
+                } else {
+                    (0, None, None)
+                };
 
-                    // Pre-calculate colors to avoid capturing `self` in layouter
-                    let log_colors_pre: Vec<egui::Color32> = logs.iter()
-                        .map(|entry| log_color(&self.format_log_text(entry)))
-                        .collect();
+                    let mut full_text = String::new();
+                    let mut line_starts = Vec::with_capacity(total_logs);
+                    let mut entry_line_numbers = Vec::with_capacity(total_logs);
+                    let mut log_colors_pre = Vec::with_capacity(total_logs);
+                    let mut current_line = 0;
+
+                    let show_hex = self.show_hex;
+                    let filter_ansi = self.filter_ansi;
+                    let format_json = self.format_json;
+                    let show_timestamp = self.show_timestamp;
+
+                    if let Some(inst) = self.open_ports.get_mut(&self.active_tab) {
+                        if let Ok(mut logs) = inst.manager.logs.lock() {
+                            for entry in logs.iter_mut() {
+                                line_starts.push(full_text.len());
+                                entry_line_numbers.push(current_line);
+                                
+                                let formatted = Self::format_log_text(entry, show_hex, filter_ansi, format_json);
+                                log_colors_pre.push(entry.cached_color.unwrap_or(C::TEXT));
+                                
+                                current_line += formatted.split('\n').count();
+                                
+                                if show_timestamp {
+                                    full_text.push_str(&format!("[{}] ", entry.timestamp));
+                                }
+                                full_text.push_str(&formatted);
+                                full_text.push('\n');
+                            }
+                        }
+                    }
+                    line_starts.push(full_text.len()); 
                     let font_size = self.font_size;
 
-                    let available_height = ui.available_height();
+
                     
                     let mut layouter = |ui: &egui::Ui, text: &str, _wrap_width: f32| {
                         let mut job = egui::text::LayoutJob::default();
@@ -1013,11 +1098,16 @@ impl eframe::App for MultiSerialApp {
                         ui.fonts(|f| f.layout_job(job))
                     };
 
-                    let scroll_area = egui::ScrollArea::vertical()
-                        .stick_to_bottom(self.auto_scroll && current_match_idx.is_none())
-                        .max_height(available_height);
+                    // Auto-scroll with tolerance: stick_to_bottom when scroll is near the bottom
+                    let should_stick = (self.auto_scroll && self.scroll_near_bottom && current_match_idx.is_none())
+                        || self.force_scroll_to_bottom;
 
-                    scroll_area.show(ui, |ui| {
+                    let scroll_area = egui::ScrollArea::vertical()
+                        .stick_to_bottom(should_stick)
+                        .auto_shrink([false, false])
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible);
+
+                    let scroll_output = scroll_area.show(ui, |ui| {
                         let mut output_text = full_text.clone();
                         let output = egui::TextEdit::multiline(&mut output_text)
                             .layouter(&mut layouter)
@@ -1053,8 +1143,61 @@ impl eframe::App for MultiSerialApp {
                             }
                         }
                     });
+
+                    // Update scroll_near_bottom for next frame (tolerance-based auto-scroll)
+                    let content_height = scroll_output.content_size.y;
+                    let viewport_height = scroll_output.inner_rect.height();
+                    let current_offset = scroll_output.state.offset.y;
+                    let max_offset = (content_height - viewport_height).max(0.0);
+                    // Use generous tolerance: at least 150px or 40% of viewport
+                    let tolerance = f32::max(150.0, viewport_height * 0.4);
+                    let distance_from_bottom = max_offset - current_offset;
+                    self.scroll_near_bottom = max_offset <= 0.0 || distance_from_bottom < tolerance;
+
+                    // Detect downward scrolling intent: if user scrolled down and is
+                    // within the bottom 30% of content, snap back to auto-scroll
+                    if self.auto_scroll && !self.scroll_near_bottom {
+                        let scrolled_down = current_offset > self.prev_scroll_offset + 1.0;
+                        let in_bottom_region = max_offset > 0.0 && distance_from_bottom < viewport_height * 0.8;
+                        if scrolled_down && in_bottom_region {
+                            self.scroll_near_bottom = true;
+                        }
+                    }
+                    self.prev_scroll_offset = current_offset;
+                    self.force_scroll_to_bottom = false;
                     self.scroll_to_match_needed = false;
-                }
+
+                    // Floating "⬇ Bottom" button when not at bottom
+                    if self.auto_scroll && !self.scroll_near_bottom {
+                        let btn_size = egui::vec2(80.0, 28.0);
+                        let panel_rect = scroll_output.inner_rect;
+                        let btn_pos = egui::pos2(
+                            panel_rect.right() - btn_size.x - 24.0,
+                            panel_rect.bottom() - btn_size.y - 12.0,
+                        );
+                        let btn_rect = egui::Rect::from_min_size(btn_pos, btn_size);
+                        let btn_id = ui.id().with("scroll_to_bottom_btn");
+                        let btn_resp = ui.interact(btn_rect, btn_id, egui::Sense::click());
+
+                        let btn_bg = if btn_resp.hovered() {
+                            egui::Color32::from_rgb(60, 130, 200)
+                        } else {
+                            egui::Color32::from_rgb(45, 100, 170)
+                        };
+                        ui.painter().rect_filled(btn_rect, 6.0, btn_bg);
+                        ui.painter().text(
+                            btn_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "⬇ Bottom",
+                            egui::FontId::proportional(13.0),
+                            egui::Color32::WHITE,
+                        );
+
+                        if btn_resp.clicked() {
+                            self.scroll_near_bottom = true;
+                            self.force_scroll_to_bottom = true;
+                        }
+                    }
             } else {
                 // Empty state
                 ui.centered_and_justified(|ui| {

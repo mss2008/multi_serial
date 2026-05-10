@@ -6,6 +6,7 @@
  */
 
 use serialport::{SerialPort, available_ports};
+use eframe::egui;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -185,6 +186,9 @@ pub struct LogEntry {
     pub timestamp: String,
     pub text: String,
     pub raw: Vec<u8>,
+    // Performance cache
+    pub cached_text: Option<String>,
+    pub cached_color: Option<egui::Color32>,
 }
 
 // ── SerialManager ────────────────────────────────────────────────
@@ -264,7 +268,7 @@ impl SerialManager {
 
                                 let ts = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
                                 let mut logs_lock = logs.lock().unwrap();
-                                logs_lock.push(LogEntry { timestamp: ts, text, raw });
+                                logs_lock.push(LogEntry { timestamp: ts, text, raw, cached_text: None, cached_color: None });
                                 if logs_lock.len() > 5000 { logs_lock.drain(0..1000); }
                             } else if b == b'\r' {
                                 // Handle \r as a terminator if not followed by \n (is handled next loop)
@@ -279,7 +283,7 @@ impl SerialManager {
                                     let text = charset.decode(&raw);
                                     let ts = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
                                     let mut logs_lock = logs.lock().unwrap();
-                                    logs_lock.push(LogEntry { timestamp: ts, text, raw });
+                                    logs_lock.push(LogEntry { timestamp: ts, text, raw, cached_text: None, cached_color: None });
                                     if logs_lock.len() > 5000 { logs_lock.drain(0..1000); }
                                 }
                             }
@@ -296,6 +300,8 @@ impl SerialManager {
                                 timestamp: ts,
                                 text: format!("[{}] ⚠ Device disconnected, auto-reconnecting…", cfg.name),
                                 raw: Vec::new(),
+                                cached_text: None,
+                                cached_color: None,
                             });
                         }
 
@@ -323,6 +329,8 @@ impl SerialManager {
                                                 timestamp: ts,
                                                 text: format!("[{}] ✓ Reconnected successfully", cfg.name),
                                                 raw: Vec::new(),
+                                                cached_text: None,
+                                                cached_color: None,
                                             });
                                             break; // Back to read loop
                                         }
